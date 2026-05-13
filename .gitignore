@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+*.log
+coverage/
+.nyc_output/
+prisma/generated/
+*.tsbuildinfo
+.DS_Store
+Thumbs.db

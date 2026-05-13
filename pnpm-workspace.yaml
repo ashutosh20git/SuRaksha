@@ -1,0 +1,4 @@
+packages:
+  - "packages/*"
+  - "services/verify-platform/*"
+  - "services/regops/*"
