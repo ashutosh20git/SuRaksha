@@ -1,0 +1,169 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options: [staging, production]
+      platform:
+        description: Platform to deploy (or "all")
+        required: true
+        type: choice
+        options: [all, verify-platform, regops]
+      image-tag:
+        description: Image tag to deploy (defaults to sha of last main build)
+        required: false
+        default: latest
+
+permissions:
+  contents: read
+  id-token: write   # OIDC
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false   # never cancel an in-flight deploy
+
+env:
+  REGISTRY: ${{ vars.REGISTRY }}
+  IMAGE_PREFIX: ${{ vars.IMAGE_PREFIX }}
+  IMAGE_TAG: ${{ inputs.image-tag }}
+
+jobs:
+  # ─── Gate: require approval for production ───────────────────────────────────
+  gate:
+    name: Approval gate
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}   # maps to GitHub environment protection rules
+    steps:
+      - run: echo "Approved for ${{ inputs.environment }}"
+
+  # ─── Deploy verify-platform ──────────────────────────────────────────────────
+  deploy-verify:
+    name: Deploy verify-platform → ${{ inputs.environment }}
+    needs: gate
+    if: inputs.platform == 'all' || inputs.platform == 'verify-platform'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    strategy:
+      max-parallel: 4
+      matrix:
+        service:
+          - applications-api
+          - documents-api
+          - verification-api
+          - underwriter-bff
+          - sot-hub
+          - verification-orchestrator
+          - decision-engine
+          - copilot-llm
+          - graph-service
+          - forensic-pipeline
+          - ocr-pipeline
+          - graph-analytics
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --region ap-south-1
+
+      - name: Update image tag in manifest
+        run: |
+          kubectl set image deployment/${{ matrix.service }} \
+            ${{ matrix.service }}=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ env.IMAGE_TAG }} \
+            -n verify-platform
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/${{ matrix.service }} \
+            -n verify-platform \
+            --timeout=5m
+
+  # ─── Deploy regops ───────────────────────────────────────────────────────────
+  deploy-regops:
+    name: Deploy regops → ${{ inputs.environment }}
+    needs: gate
+    if: inputs.platform == 'all' || inputs.platform == 'regops'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    strategy:
+      max-parallel: 4
+      matrix:
+        service:
+          - ingestion-crawler
+          - novelty-detector
+          - interpreter-agent
+          - applicability-agent
+          - map-decomposer
+          - router-agent
+          - workflow-injector
+          - validation-agents
+          - conflict-detector
+          - audit-recorder
+          - compliance-api
+          - regops-orchestrator
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --region ap-south-1
+
+      - name: Update image tag in manifest
+        run: |
+          kubectl set image deployment/${{ matrix.service }} \
+            ${{ matrix.service }}=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:${{ env.IMAGE_TAG }} \
+            -n regops
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/${{ matrix.service }} \
+            -n regops \
+            --timeout=5m
+
+  # ─── Post-deploy smoke test ──────────────────────────────────────────────────
+  smoke:
+    name: Smoke test — ${{ inputs.environment }}
+    needs: [deploy-verify, deploy-regops]
+    if: always() && (needs.deploy-verify.result == 'success' || needs.deploy-regops.result == 'success')
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Health check — verify-platform APIs
+        if: inputs.platform == 'all' || inputs.platform == 'verify-platform'
+        run: |
+          BASE=${{ secrets.VERIFY_PLATFORM_BASE_URL }}
+          for svc in applications documents verification; do
+            status=$(curl -sf -o /dev/null -w "%{http_code}" "$BASE/api/v1/$svc/healthz" || echo "000")
+            echo "$svc → $status"
+            [ "$status" = "200" ] || exit 1
+          done
+
+      - name: Health check — regops APIs
+        if: inputs.platform == 'all' || inputs.platform == 'regops'
+        run: |
+          BASE=${{ secrets.REGOPS_BASE_URL }}
+          status=$(curl -sf -o /dev/null -w "%{http_code}" "$BASE/api/v1/regulations/healthz" || echo "000")
+          echo "compliance-api → $status"
+          [ "$status" = "200" ] || exit 1

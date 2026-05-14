@@ -1,0 +1,289 @@
+name: Build & Push
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write   # OIDC for cloud registry auth
+
+env:
+  REGISTRY: ${{ vars.REGISTRY }}          # e.g. 123456789.dkr.ecr.ap-south-1.amazonaws.com
+  IMAGE_PREFIX: ${{ vars.IMAGE_PREFIX }}  # e.g. suraksha
+
+jobs:
+  # ─── Detect which services changed ──────────────────────────────────────────
+  detect:
+    name: Detect changed services
+    runs-on: ubuntu-latest
+    outputs:
+      node-services: ${{ steps.filter.outputs.node-services }}
+      python-services: ${{ steps.filter.outputs.python-services }}
+      node-matrix: ${{ steps.matrix.outputs.node }}
+      python-matrix: ${{ steps.matrix.outputs.python }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            packages: &packages
+              - 'packages/**'
+            # ── verify-platform Node services ─────────────────────────────────
+            applications-api:
+              - *packages
+              - 'services/verify-platform/applications-api/**'
+            documents-api:
+              - *packages
+              - 'services/verify-platform/documents-api/**'
+            verification-api:
+              - *packages
+              - 'services/verify-platform/verification-api/**'
+            underwriter-bff:
+              - *packages
+              - 'services/verify-platform/underwriter-bff/**'
+            sot-hub:
+              - *packages
+              - 'services/verify-platform/sot-hub/**'
+            verification-orchestrator:
+              - *packages
+              - 'services/verify-platform/verification-orchestrator/**'
+            decision-engine:
+              - *packages
+              - 'services/verify-platform/decision-engine/**'
+            copilot-llm:
+              - *packages
+              - 'services/verify-platform/copilot-llm/**'
+            graph-service:
+              - *packages
+              - 'services/verify-platform/graph-service/**'
+            # ── regops Node services ───────────────────────────────────────────
+            ingestion-crawler:
+              - *packages
+              - 'services/regops/ingestion-crawler/**'
+            novelty-detector:
+              - *packages
+              - 'services/regops/novelty-detector/**'
+            interpreter-agent:
+              - *packages
+              - 'services/regops/interpreter-agent/**'
+            applicability-agent:
+              - *packages
+              - 'services/regops/applicability-agent/**'
+            map-decomposer:
+              - *packages
+              - 'services/regops/map-decomposer/**'
+            router-agent:
+              - *packages
+              - 'services/regops/router-agent/**'
+            workflow-injector:
+              - *packages
+              - 'services/regops/workflow-injector/**'
+            validation-agents:
+              - *packages
+              - 'services/regops/validation-agents/**'
+            conflict-detector:
+              - *packages
+              - 'services/regops/conflict-detector/**'
+            audit-recorder:
+              - *packages
+              - 'services/regops/audit-recorder/**'
+            compliance-api:
+              - *packages
+              - 'services/regops/compliance-api/**'
+            regops-orchestrator:
+              - *packages
+              - 'services/regops/regops-orchestrator/**'
+            # ── Python services ────────────────────────────────────────────────
+            forensic-pipeline:
+              - 'services/verify-platform/forensic-pipeline/**'
+            ocr-pipeline:
+              - 'services/verify-platform/ocr-pipeline/**'
+            graph-analytics:
+              - 'services/verify-platform/graph-analytics/**'
+
+      - name: Build service matrices
+        id: matrix
+        run: |
+          NODE_SERVICES=(
+            applications-api:verify-platform
+            documents-api:verify-platform
+            verification-api:verify-platform
+            underwriter-bff:verify-platform
+            sot-hub:verify-platform
+            verification-orchestrator:verify-platform
+            decision-engine:verify-platform
+            copilot-llm:verify-platform
+            graph-service:verify-platform
+            ingestion-crawler:regops
+            novelty-detector:regops
+            interpreter-agent:regops
+            applicability-agent:regops
+            map-decomposer:regops
+            router-agent:regops
+            workflow-injector:regops
+            validation-agents:regops
+            conflict-detector:regops
+            audit-recorder:regops
+            compliance-api:regops
+            regops-orchestrator:regops
+          )
+
+          PYTHON_SERVICES=(
+            forensic-pipeline:verify-platform
+            ocr-pipeline:verify-platform
+            graph-analytics:verify-platform
+          )
+
+          build_matrix() {
+            local services=("$@")
+            local json="["
+            local first=true
+            for entry in "${services[@]}"; do
+              svc="${entry%%:*}"
+              platform="${entry##*:}"
+              changed=$(echo '${{ toJson(steps.filter.outputs) }}' | \
+                python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('$svc','false'))")
+              if [ "$changed" = "true" ]; then
+                [ "$first" = "true" ] && first=false || json+=","
+                json+="{\"service\":\"$svc\",\"platform\":\"$platform\"}"
+              fi
+            done
+            json+="]"
+            echo "$json"
+          }
+
+          echo "node=$(build_matrix "${NODE_SERVICES[@]}")" >> $GITHUB_OUTPUT
+          echo "python=$(build_matrix "${PYTHON_SERVICES[@]}")" >> $GITHUB_OUTPUT
+
+  # ─── Build Node service images ───────────────────────────────────────────────
+  build-node:
+    name: Build ${{ matrix.service }}
+    needs: detect
+    if: needs.detect.outputs.node-matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect.outputs.node-matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Log in to registry
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/${{ matrix.platform }}/${{ matrix.service }}.Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          provenance: true
+          sbom: true
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:sha-${{ github.sha }}
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
+
+  # ─── Build Python service images ─────────────────────────────────────────────
+  build-python:
+    name: Build ${{ matrix.service }}
+    needs: detect
+    if: needs.detect.outputs.python-matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect.outputs.python-matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Log in to registry
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: services/${{ matrix.platform }}/${{ matrix.service }}
+          file: infra/docker/${{ matrix.platform }}/${{ matrix.service }}.Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          provenance: true
+          sbom: true
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}:sha-${{ github.sha }}
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
